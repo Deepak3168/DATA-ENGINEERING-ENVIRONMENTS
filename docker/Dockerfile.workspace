@@ -1,0 +1,45 @@
+FROM python:3.11-slim
+
+USER root
+
+# Install system dependencies & OpenJDK for PySpark
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openjdk-17-jre-headless \
+    curl \
+    procps \
+    netcat-traditional \
+    build-essential \
+    libpq-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+ENV PATH=$JAVA_HOME/bin:$PATH
+
+# Install Python DE stack
+RUN pip install --no-cache-dir \
+    jupyterlab \
+    pyspark==3.5.1 \
+    duckdb \
+    pandas \
+    pyarrow \
+    polars \
+    boto3 \
+    minio \
+    psycopg2-binary \
+    sqlalchemy \
+    deltalake \
+    faker \
+    requests \
+    tabulate \
+    pydantic
+
+# Create app directory
+WORKDIR /workspace
+
+# Copy sample notebooks and scripts
+COPY . /workspace/
+
+EXPOSE 8888
+
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--NotebookApp.token='admin'"]

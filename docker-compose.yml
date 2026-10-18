@@ -1,0 +1,245 @@
+services:
+  # ============================================================================
+  # 1. METASTORE & RELATIONAL DATABASES (OLTP Source + OLAP Warehouse + Airflow)
+  # ============================================================================
+  postgres:
+    image: postgres:16-alpine
+    container_name: de_postgres
+    restart: always
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init-scripts:/docker-entrypoint-initdb.d
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - de_network
+
+  # ============================================================================
+  # 2. OBJECT STORAGE / CLOUD DATA LAKE MOCK (AWS S3 / GCS API Compatible)
+  # ============================================================================
+  minio:
+    image: minio/minio:RELEASE.2024-05-10T01-41-38Z
+    container_name: de_minio
+    restart: always
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:-minioadmin}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:-minioadmin}
+    ports:
+      - "9000:9000"   # S3 API Endpoint
+      - "9001:9001"   # MinIO Web Console
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio_data:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - de_network
+
+  minio-setup:
+    image: minio/mc:latest
+    container_name: de_minio_setup
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      /usr/bin/mc alias set local http://minio:9000 ${MINIO_ROOT_USER:-minioadmin} ${MINIO_ROOT_PASSWORD:-minioadmin};
+      /usr/bin/mc mb --ignore-existing local/bronze;
+      /usr/bin/mc mb --ignore-existing local/silver;
+      /usr/bin/mc mb --ignore-existing local/gold;
+      /usr/bin/mc mb --ignore-existing local/airflow-logs;
+      /usr/bin/mc anonymous set download local/bronze;
+      echo 'MinIO buckets (bronze, silver, gold, airflow-logs) created successfully.';
+      exit 0;
+      "
+    networks:
+      - de_network
+
+  # ============================================================================
+  # 3. DISTRIBUTED DATA PROCESSING ENGINE (Apache Spark 3.5.1)
+  # ============================================================================
+  spark-master:
+    image: bitnami/spark:3.5.1
+    container_name: de_spark_master
+    restart: always
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_USER=spark
+      - SPARK_DAEMON_MEMORY=512m
+    ports:
+      - "7077:7077"   # Spark Master RPC
+      - "8080:8080"   # Spark Master Web UI
+    volumes:
+      - ./scripts:/opt/spark/scripts
+      - ./data:/opt/spark/data
+    networks:
+      - de_network
+
+  spark-worker:
+    image: bitnami/spark:3.5.1
+    container_name: de_spark_worker
+    restart: always
+    depends_on:
+      - spark-master
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=1G
+      - SPARK_WORKER_CORES=2
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+      - SPARK_USER=spark
+    ports:
+      - "8081:8081"   # Spark Worker Web UI
+    volumes:
+      - ./scripts:/opt/spark/scripts
+      - ./data:/opt/spark/data
+    networks:
+      - de_network
+
+  # ============================================================================
+  # 4. WORKFLOW ORCHESTRATION (Apache Airflow 2.9.3)
+  # ============================================================================
+  airflow-init:
+    image: apache/airflow:2.9.3
+    container_name: de_airflow_init
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      &airflow-common-env
+      AIRFLOW__CORE__ENVIRONMENT: "local_mock"
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/airflow
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+      AIRFLOW__CORE__PARALLELISM: 4
+      AIRFLOW__CORE__MAX_ACTIVE_TASKS_PER_DAG: 2
+      AIRFLOW__CORE__MAX_ACTIVE_RUNS_PER_DAG: 1
+      AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+      _PIP_ADDITIONAL_REQUIREMENTS: "apache-airflow-providers-postgres apache-airflow-providers-apache-spark apache-airflow-providers-amazon boto3 psycopg2-binary duckdb requests pandas"
+    entrypoint: >
+      /bin/bash -c "
+      airflow db migrate &&
+      airflow users create \
+        --username ${AIRFLOW_ADMIN_USER:-admin} \
+        --firstname Admin \
+        --lastname Trainer \
+        --role Admin \
+        --email admin@example.com \
+        --password ${AIRFLOW_ADMIN_PASSWORD:-admin} || true
+      "
+    networks:
+      - de_network
+
+  airflow-webserver:
+    image: apache/airflow:2.9.3
+    container_name: de_airflow_webserver
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+    ports:
+      - "8089:8080"   # Airflow Web UI mapped to host 8089 (avoid 8080 Spark clash)
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+    healthcheck:
+      test: ["CMD-SHELL", "[ -f /opt/airflow/airflow-webserver.pid ] || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 5
+    command: webserver
+    networks:
+      - de_network
+
+  airflow-scheduler:
+    image: apache/airflow:2.9.3
+    container_name: de_airflow_scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
+    environment:
+      <<: *airflow-common-env
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./logs:/opt/airflow/logs
+      - ./plugins:/opt/airflow/plugins
+      - ./scripts:/opt/airflow/scripts
+      - ./data:/opt/airflow/data
+    command: scheduler
+    networks:
+      - de_network
+
+  # ============================================================================
+  # 5. DATA ENGINEERING LAB & INTERACTIVE JUPYTER / PYSPARK WORKSPACE
+  # ============================================================================
+  workspace:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.workspace
+    container_name: de_workspace
+    restart: always
+    depends_on:
+      postgres:
+        condition: service_healthy
+      minio:
+        condition: service_healthy
+      spark-master:
+        condition: service_started
+    environment:
+      - AWS_ACCESS_KEY_ID=${MINIO_ROOT_USER:-minioadmin}
+      - AWS_SECRET_ACCESS_KEY=${MINIO_ROOT_PASSWORD:-minioadmin}
+      - AWS_ENDPOINT_URL=http://minio:9000
+      - S3_ENDPOINT=http://minio:9000
+      - SPARK_MASTER=spark://spark-master:7077
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
+      - POSTGRES_USER=${POSTGRES_USER:-postgres}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
+    ports:
+      - "8888:8888"   # JupyterLab Web UI (Token: admin)
+    volumes:
+      - ./notebooks:/workspace/notebooks
+      - ./scripts:/workspace/scripts
+      - ./data:/workspace/data
+      - ./dags:/workspace/dags
+    networks:
+      - de_network
+
+networks:
+  de_network:
+    name: de_cloud_mock_network
+    driver: bridge
+
+volumes:
+  postgres_data:
+  minio_data:
